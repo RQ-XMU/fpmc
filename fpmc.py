@@ -7,6 +7,7 @@ Created on Tue Jul 23 11:21:25 2019
 from __future__ import division
 from __future__ import print_function
 import numpy as np
+import pandas as pd
 import math
 import random
 import re
@@ -35,14 +36,95 @@ class FPMC(object):
         self.k_cf = k_cf
         self.k_mc = k_mc
 
-    def prepare_model(self, dataset):
+    def init_model(self):
+        ''' Initialize the model parameters
+        '''
+        self.V_user_item = self.init_sigma * np.random.randn(self.n_users, self.k_cf).astype(np.float32)
+        self.V_item_user = self.init_sigma * np.random.randn(self.n_items, self.k_cf).astype(np.float32)
+        self.V_prev_next = self.init_sigma * np.random.randn(self.n_items, self.k_mc).astype(np.float32)
+        self.V_next_prev = self.init_sigma * np.random.randn(self.n_items, self.k_mc).astype(np.float32)
+
+    def prepare_model(self):
+        #所谓的验证集、测试集、训练集应该怎么处理？
+        #疑问1：训练集应该包含测试集和训练集中所有的user和item吗？如果不包含，是不是所谓的cold-start问题？
+        #疑问2：如果出现了cold-start，应该如何处理？
+        #2019-8-3:按照这里的代码逻辑，不涉及cold start问题。
         '''Must be called before using train, load or top_k_recommendations
         '''
+        dataset = pd.read_csv("DataSet/yelp.train.rating", sep='\t', header=None, usecols=[0, 1, 2, 3], dtype={0: np.int32, 1: np.int64, 2: np.float32, 3: str})
+        dataset.columns = ["SessionId", "ItemId", "Rating", "Time"]
+        dataset.sort_values(["SessionId", "Time"], inplace=True)
+        dataset = dataset.reset_index(drop=True)
         self.dataset = dataset
-        self.valset = self.dataset[np.in1d(dataset.SessionId, dataset.SessionId.unique()[
-                                                              -1000:])]  # 这里为什么有个1000?这个valset变量的作用是什么?valset的意思是验证集吗？如果这样的话就可以理解1000的含义了
         self.n_items = dataset.ItemId.nunique()
         self.n_users = dataset.SessionId.nunique()
+
+        test_set = []
+        val_set = []
+
+        for userid in range(self.n_users):
+            temp_df = self.dataset[self.dataset.SessionId == userid]
+            temp_list = []#[userid, (item_id, last_item_id), rating]
+            last_item_id = temp_df[-3:-2].iloc[0, 1]
+            item_id = temp_df[-2:-1].iloc[0, 1]
+            temp_list.append(temp_df[-2:-1].iloc[0, 0])
+            temp_list.append((item_id, last_item_id))
+            temp_list.append(temp_df[-2:-1].iloc[0, 2])
+            val_set.append(temp_list)
+
+        for userid in range(self.n_users):
+            temp_df = self.dataset[self.dataset.SessionId == userid]
+            temp_list = []  # [userid, (item_id, last_item_id), rating]
+            last_item_id = temp_df[-2:-1].iloc[0, 1]
+            item_id = temp_df[-1:].iloc[0, 1]
+            temp_list.append(temp_df[-1:].iloc[0, 0])
+            temp_list.append((item_id, last_item_id))
+            temp_list.append(temp_df[-1:].iloc[0, 2])
+            test_set.append(temp_list)
+
+        list_train = []
+
+        for userid in range(self.n_users):
+            list_train.append(self.dataset[self.dataset.SessionId == userid][:-2])
+
+        train_df = pd.concat(list_train, axis=0)
+        train_df = train_df.reset_index(drop=True)
+
+        self.trainset = train_df
+        self.valset = val_set
+        self.testset = test_set
+
+        self.ratings_dict = {}#数据结构为dict的dict，即每个user有一个评分dict，在形成训练样本时有用。
+        self.user_input, self.item_input_prev, self.item_input_next = [], [], []
+        for userid in range(self.n_items):
+            for row in self.dataset[self.dataset.SessionId == userid].itertuples(index=False):
+                if row[0] not in self.ratings_dict:
+                    self.ratings_dict[row[0]] = {}
+                    self.ratings_dict[row[0]][row[1]] = row[2]
+                else:
+                    self.ratings_dict[row[0]][row[1]] = row[2]
+
+        prev_item = -1
+        current_item = -1
+        current_user = -1
+        next_user = -1
+        for row in self.trainset.itertuples(index=False):
+            next_user, current_item = row[0], row[1]
+            if next_user != current_user:
+                current_user = next_user
+                prev_item = current_item
+            else:
+                current_user = next_user
+                self.user_input.append(next_user)
+                self.item_input_prev.append(prev_item)
+                self.item_input_next.append(current_item)
+                prev_item = current_item
+
+    def _get_model_filename(self, epochs):
+        '''Return the name of the file to save the current model
+        '''
+        filename = "fpmc_ne"+str(epochs)+"_lr"+str(self.init_learning_rate)+"_an"+str(self.annealing_rate)+"_kcf"+str(self.k_cf)+"_kmc"+str(self.k_mc)+"_reg"+str(self.reg)+"_ini"+str(self.init_sigma)
+        return filename+".npz"
 
     def change_data_format(self, dataset):
         # 这里针对items主要有三个变量，并且后面也会用到
@@ -50,6 +132,7 @@ class FPMC(object):
         '''Gets a generator of data in the sequence format and save data in the csr format
         '''
         # csr格式，好像是稀疏矩阵的一种存储方式
+        #2019-8-3：这个函数应该没什么用
         self.users = np.zeros((self.n_users, 2), dtype=np.int32)
         self.items = np.zeros(len(dataset), dtype=np.int32)
 
@@ -112,24 +195,32 @@ class FPMC(object):
     def _compute_validation_metrics(self, metrics):
         ev = evaluation_val.Evaluator(self.dataset, k=10)
 
-        session_idx = self.valset.columns.get_loc('SessionId')
-        item_idx = self.valset.columns.get_loc('ItemId')
-
-        last_item = -1
-        last_session = -1
-        for row in self.valset.itertuples(index=False):
-            item, session = row[item_idx], row[session_idx]
-
-            if last_session != session:
-                last_item = -1
-
-            if last_item != -1:
-                seq = [[self.item_map[last_item]]]
-                top_k = self.top_k_recommendations(seq, user_id=self.user_map[session])
-                ev.add_instance([self.item_map[item]], top_k)
-
-            last_item = item
-            last_session = session
+        for userid in range(self.n_users):
+            if  self.valset[userid][2] > 1.0:#这里要考虑到自己做的假设，与BPR不同，只以在大于1.0评分上的记录的指标为标准。
+                seq = [[self.valset[userid][1][1]]]
+                top_k = self.top_k_recommendations(seq, user_id=userid)
+                ev.add_instance([self.valset[userid][1][0]], top_k)
+        # session_idx = self.valset.columns.get_loc('SessionId')
+        # item_idx = self.valset.columns.get_loc('ItemId')
+        #
+        # last_item = -1
+        # last_session = -1
+        # for row in self.valset.itertuples(index=False):
+        #     item, session = row[item_idx], row[session_idx]
+        #
+        #     if last_session != session:
+        #         last_item = -1
+        #
+        #     if last_item != -1:
+        #         seq = [[last_item]]
+        #         top_k = self.top_k_recommendations(seq, user_id=session)
+        #         ev.add_instance([item], top_k)
+        #         # seq = [[self.item_map[last_item]]]
+        #         #top_k = self.top_k_recommendations(seq, user_id=self.user_map[session])
+        #         #ev.add_instance([self.item_map[item]], top_k)
+        #
+        #     last_item = item
+        #     last_session = session
 
         metrics['recall'].append(ev.average_recall())
         metrics['sps'].append(ev.sps())
@@ -145,18 +236,18 @@ class FPMC(object):
                 time_based_progress=False,
                 autosave='Best',
                 save_dir='mdl/',
-                min_iterations=100000,
+                min_iter=100000,
                 max_iter=2000000,
                 max_progress_interval=np.inf,
                 load_last_model=False,
                 early_stopping=None,
                 validation_metrics=['sps']):
-                        # Change data format
-            self.change_data_format(dataset)
+            # 转换数据格式，初始化相关变量（在adapter.py中已经初始化了）
+            #self.prepare_model(dataset)
             # del dataset.training_set.lines
-            if len(set(validation_metrics) & set(self.metrics.keys())) < len(validation_metrics):
-                raise ValueError(
-                    'Incorrect validation metrics. Metrics must be chosen among: ' + ', '.join(self.metrics.keys()))
+            # if len(set(validation_metrics) & set(self.metrics.keys())) < len(validation_metrics):
+            #     raise ValueError(
+            #         'Incorrect validation metrics. Metrics must be chosen among: ' + ', '.join(self.metrics.keys()))
 
             # Load last model if needed, else initialise the model
             iterations = 0
@@ -198,7 +289,7 @@ class FPMC(object):
 
                 if progress_indicator >= next_save:
 
-                    if progress_indicator >= min_iterations:
+                    if progress_indicator >= min_iter:
 
                         # Save current epoch
                         epochs.append(epochs_offset + iterations / len(dataset))
@@ -304,19 +395,8 @@ class FPMC(object):
 
         return last_batch
 
-    def _get_model_filename(self, epochs):
-        '''Return the name of the file to save the current model
-        '''
-        filename = "fpmc_ne"+str(epochs)+"_lr"+str(self.init_learning_rate)+"_an"+str(self.annealing_rate)+"_kcf"+str(self.k_cf)+"_kmc"+str(self.k_mc)+"_reg"+str(self.reg)+"_ini"+str(self.init_sigma)
-        return filename+".npz"
-
-    def init_model(self):
-        ''' Initialize the model parameters
-        '''
-        self.V_user_item = self.init_sigma * np.random.randn(self.n_users, self.k_cf).astype(np.float32)
-        self.V_item_user = self.init_sigma * np.random.randn(self.n_items, self.k_cf).astype(np.float32)
-        self.V_prev_next = self.init_sigma * np.random.randn(self.n_items, self.k_mc).astype(np.float32)
-        self.V_next_prev = self.init_sigma * np.random.randn(self.n_items, self.k_mc).astype(np.float32)
+    def training_step(self, iterations):
+        return self.sgd_step(*self.get_training_sample())
 
     def sgd_step(self, user, prev_item, true_next, false_next):
         ''' Make one SGD update, given that the transition from prev_item to true_next exist in user history,
@@ -350,21 +430,32 @@ class FPMC(object):
         '''Pick a random triplet from self.triplets and a random false next item.
         returns a tuple of ids : (user, prev_item, true_next, false_next)
         '''
-
-        # user_id, prev_item, true_next = random.choice(self.triplets)
-        user_id = random.randrange(self.n_users)
-        while self.users[user_id,1] < 2:
-            user_id = random.randrange(self.n_users)
-        r = random.randrange(self.users[user_id,1]-1)
-        prev_item = self.items[self.users[user_id,0]+r]
-        true_next = self.items[self.users[user_id,0]+r+1]
-        #按照这份代码的话，进行sgd更新的时候用到的是在训练集中某个用户最新的两次相邻记录
-        false_next = random.randrange(self.n_items-1)
-        if false_next >= true_next: # To make sure false_next != true_next 这一步操作不是很明白？
-                #如果只是为了达到不等于的目的话，那直接改成！=不就完了吗
-            false_next += 1
-
-        return (user_id, prev_item, true_next, false_next)
+        #这里在挑选一个训练样本的时候，不是按照implicit feedback下的BPR假设来；
+        #和rating相关联，如果评分为1，那么将true next和false next分开来。
+        index = random.randrange(len(self.user_input))
+        user_id = self.user_input[index]
+        item_prev = self.item_input_prev[index]
+        item_true_next = self.item_input_next[index]
+        item_true_next_rating = self.ratings_dict[user_id][item_true_next]
+        item_false_next = random.randrange (self.n_items)
+        while item_false_next == item_true_next:
+            item_false_next = random.randrange(self.n_items)
+        if item_true_next_rating < 2.0:
+            return (user_id, item_prev, item_false_next, item_true_next)
+        else:
+            return (user_id, item_prev, item_true_next, item_false_next)
+        # while self.users[user_id,1] < 2:
+        #     user_id = random.randrange(self.n_users)
+        # r = random.randrange(self.users[user_id,1]-1)
+        # prev_item = self.items[self.users[user_id,0]+r]
+        # true_next = self.items[self.users[user_id,0]+r+1]
+        # #按照这份代码的话，进行sgd更新的时候用到的是在训练集中某个用户最新的两次相邻记录
+        # false_next = random.randrange(self.n_items-1)
+        # if false_next >= true_next: # To make sure false_next != true_next 这一步操作不是很明白？
+        #         #如果只是为了达到不等于的目的话，那直接改成！=不就完了吗
+        #     false_next += 1
+        #
+        # return (user_id, prev_item, true_next, false_next)
 
     def top_k_recommendations(self, sequence, user_id=None, k=10, exclude=None, session=None):
         ''' Recieves a sequence of (id, rating), and produces k recommendations (as a list of ids)
@@ -377,6 +468,7 @@ class FPMC(object):
         #那么在测试集中用训练好的模型进行评分计算时，若传入user_id，则会出现keyerror的情况
         #2019-7-20：在别的论文中看到，这种操作就属于冷启动问题了，给你一个新用户，怎么去操作？一般
         #那些没有考虑冷启动问题的实验，测试集中的用户和item都是包含在训练集中的。
+        #在valset进行验证时，无论是源代码还是自己的代码，都不存在cold-start的问题。
         if exclude is None:
             exclude = []
 
@@ -384,6 +476,7 @@ class FPMC(object):
         if user_id is None:
             uv = self.V_item_user[session].mean(axis=0)
             #这一步，虽然能保证最后的结果的形式是可以计算的，可是为什么能这么计算？
+            #2019-8-3：可能是在testset上针对cold start的计算方案。
         else:
             uv = self.V_user_item[user_id, :]
         output = np.dot(uv, self.V_item_user.T) + np.dot(self.V_prev_next[last_item, :], self.V_next_prev.T)
@@ -395,18 +488,14 @@ class FPMC(object):
         # find top k according to output
         return list(np.argpartition(-output, range(k))[:k])
 
-    def recommendations(self, sequence, user_id=None, exclude=None, session=None):
+    def recommendations(self, item_id, user_id):
             ''' Recieves a sequence of (id, rating), and produces k recommendations (as a list of ids)
             debug的时候发现传入的sequence并不是(id, rating)格式
              这里的推荐和上一个top_k推荐有什么不同吗？
             '''
 
-            if exclude is None:
-                exclude = []
-
-            last_item = sequence[-1][0]
-            if user_id is None:
-                uv = self.V_item_user[session].mean(axis=0)  # 这里的求推荐得分的操作没看懂
+            # if user_id is None:
+            #     uv = self.V_item_user[session].mean(axis=0)  # 这里的求推荐得分的操作没看懂
                 # 这样操作的可能原因：当测试集中出现了训练集中没有的sessionid时，通过这种方式来求解最终的推荐分数
                 # 但是给的代码貌似每个sessionid都是这样做的，这就不能理解了，而且是用的
                 # V_item_user来做的，这更不能理解了
@@ -422,15 +511,12 @@ class FPMC(object):
             #        评分由两部分组成，1、V_item_user和V_item_user的转置相乘；2、MC模型的得分计算
             #        但是FPMC论文中好像没有明确说明这一点
             #        '''
-            else:
-                uv = self.V_user_item[user_id, :]
-            output = np.dot(uv, self.V_item_user.T) + np.dot(self.V_prev_next[last_item, :],
+            # else:
+            uv = self.V_user_item[user_id, :]
+            output = np.dot(uv, self.V_item_user.T) + np.dot(self.V_prev_next[item_id, :],
                                                              self.V_next_prev.T)  # 计算training set中所有item的得分，
 
             return output
-
-    def training_step(self, iterations):
-        return self.sgd_step(*self.get_training_sample())
 
     def save(self, filename):
         '''Save the parameters of a network into a file

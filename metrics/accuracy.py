@@ -26,12 +26,12 @@ class MRR:
             rank = res.index.get_loc( next_item ) + 1
             self.pos += ( 1.0/rank )
 
-    def add_batch(self, result, next_item):
-        i = 0
-        for part, series in result.iteritems():
-            result.sort_values( part, ascending=False, inplace=True )
-            self.add( series, next_item[i] )
-            i += 1
+    # def add_batch(self, result, next_item):
+    #     i = 0
+    #     for part, series in result.iteritems():
+    #         result.sort_values( part, ascending=False, inplace=True )
+    #         self.add( series, next_item[i] )
+    #         i += 1
 
     def result(self):
         return ("MRR@" + str(self.length) + ": "), (self.pos/self.test)
@@ -49,17 +49,17 @@ class HitRate:
         self.test = 0
         self.hit = 0
 
-    def add(self, result, next_item, for_item=0, session=0):
+    def add(self, result, next_item):
         self.test += 1
         if next_item in result[:self.length].index:
             self.hit += 1
 
-    def add_batch(self, result, next_item):
-        i = 0
-        for part, series in result.iteritems():
-            result.sort_values(part, ascending=False, inplace=True)
-            self.add(series, next_item[i])
-            i += 1
+    # def add_batch(self, result, next_item):
+    #     i = 0
+    #     for part, series in result.iteritems():
+    #         result.sort_values(part, ascending=False, inplace=True)
+    #         self.add(series, next_item[i])
+    #         i += 1
 
     def result(self):
         return ("HitRate@" + str(self.length) + ": "), (self.hit/self.test)

@@ -20,14 +20,9 @@ class Adapter:
         self.instance.prepare_model(data)
         self.instance.train(data, max_iter=max_iterations, min_iter=min_iterations, progress=progress)
 
-    def predict_next(self, session_id, input_item_id, predict_for_item_ids, skip=False, type='view', timestamp=0):
-        iidx = self.instance.item_map[input_item_id]
-        if self.current_session is None or self.current_session != session_id:
-            self.current_session = session_id
-            self.session = [iidx]
-        else:
-            self.session.append(iidx)
 
-        out = self.instance.recommendations([[iidx]], session=self.session)
+    def predict_next(self, session_id, input_item_id):
 
-        return pd.Series(data=out, index=self.instance.item_list)
+        out = self.instance.recommendations(input_item_id, session_id)
+
+        return pd.Series(data=out, index=range(len(out)))#这里记得改
